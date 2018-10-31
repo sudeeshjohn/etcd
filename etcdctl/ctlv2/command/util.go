@@ -28,8 +28,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coreos/etcd/client"
-	"github.com/coreos/etcd/pkg/transport"
+	"go.etcd.io/etcd/client"
+	"go.etcd.io/etcd/pkg/transport"
 
 	"github.com/bgentry/speakeasy"
 	"github.com/urfave/cli"
@@ -270,12 +270,12 @@ func isConnectionError(err error) bool {
 			return true
 		}
 		return isConnectionError(t.Err)
-	case net.Error:
-		if t.Timeout() {
-			return true
-		}
 	case syscall.Errno:
 		if t == syscall.ECONNREFUSED {
+			return true
+		}
+	case net.Error:
+		if t.Timeout() {
 			return true
 		}
 	}

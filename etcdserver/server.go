@@ -29,37 +29,38 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/coreos/etcd/auth"
-	"github.com/coreos/etcd/etcdserver/api"
-	"github.com/coreos/etcd/etcdserver/api/membership"
-	"github.com/coreos/etcd/etcdserver/api/rafthttp"
-	"github.com/coreos/etcd/etcdserver/api/snap"
-	"github.com/coreos/etcd/etcdserver/api/v2discovery"
-	"github.com/coreos/etcd/etcdserver/api/v2http/httptypes"
-	stats "github.com/coreos/etcd/etcdserver/api/v2stats"
-	"github.com/coreos/etcd/etcdserver/api/v2store"
-	"github.com/coreos/etcd/etcdserver/api/v3alarm"
-	"github.com/coreos/etcd/etcdserver/api/v3compactor"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/lease"
-	"github.com/coreos/etcd/lease/leasehttp"
-	"github.com/coreos/etcd/mvcc"
-	"github.com/coreos/etcd/mvcc/backend"
-	"github.com/coreos/etcd/pkg/fileutil"
-	"github.com/coreos/etcd/pkg/idutil"
-	"github.com/coreos/etcd/pkg/pbutil"
-	"github.com/coreos/etcd/pkg/runtime"
-	"github.com/coreos/etcd/pkg/schedule"
-	"github.com/coreos/etcd/pkg/types"
-	"github.com/coreos/etcd/pkg/wait"
-	"github.com/coreos/etcd/raft"
-	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/coreos/etcd/version"
-	"github.com/coreos/etcd/wal"
+	"go.etcd.io/etcd/auth"
+	"go.etcd.io/etcd/etcdserver/api"
+	"go.etcd.io/etcd/etcdserver/api/membership"
+	"go.etcd.io/etcd/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/etcdserver/api/snap"
+	"go.etcd.io/etcd/etcdserver/api/v2discovery"
+	"go.etcd.io/etcd/etcdserver/api/v2http/httptypes"
+	stats "go.etcd.io/etcd/etcdserver/api/v2stats"
+	"go.etcd.io/etcd/etcdserver/api/v2store"
+	"go.etcd.io/etcd/etcdserver/api/v3alarm"
+	"go.etcd.io/etcd/etcdserver/api/v3compactor"
+	pb "go.etcd.io/etcd/etcdserver/etcdserverpb"
+	"go.etcd.io/etcd/lease"
+	"go.etcd.io/etcd/lease/leasehttp"
+	"go.etcd.io/etcd/mvcc"
+	"go.etcd.io/etcd/mvcc/backend"
+	"go.etcd.io/etcd/pkg/fileutil"
+	"go.etcd.io/etcd/pkg/idutil"
+	"go.etcd.io/etcd/pkg/pbutil"
+	"go.etcd.io/etcd/pkg/runtime"
+	"go.etcd.io/etcd/pkg/schedule"
+	"go.etcd.io/etcd/pkg/types"
+	"go.etcd.io/etcd/pkg/wait"
+	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/version"
+	"go.etcd.io/etcd/wal"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/coreos/pkg/capnslog"
 	humanize "github.com/dustin/go-humanize"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
@@ -99,7 +100,7 @@ const (
 )
 
 var (
-	plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "etcdserver")
+	plog = capnslog.NewPackageLogger("go.etcd.io/etcd", "etcdserver")
 
 	storeMemberAttributeRegexp = regexp.MustCompile(path.Join(membership.StoreMembersPrefix, "[[:xdigit:]]{1,16}", "attributes"))
 )
@@ -211,6 +212,9 @@ type EtcdServer struct {
 	stopping chan struct{}
 	// done is closed when all goroutines from start() complete.
 	done chan struct{}
+	// leaderChanged is used to notify the linearizable read loop to drop the old read requests.
+	leaderChanged   chan struct{}
+	leaderChangedMu sync.RWMutex
 
 	errorc     chan error
 	id         types.ID
@@ -357,7 +361,6 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		cl.SetID(types.ID(0), existingCluster.ID())
 		cl.SetStore(st)
 		cl.SetBackend(be)
-		cfg.Print()
 		id, n, s, w = startNode(cfg, cl, nil)
 		cl.SetID(id, existingCluster.ID())
 
@@ -393,7 +396,6 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		}
 		cl.SetStore(st)
 		cl.SetBackend(be)
-		cfg.PrintWithInitial()
 		id, n, s, w = startNode(cfg, cl, cl.MemberIDs())
 		cl.SetID(id, cl.ID())
 
@@ -458,8 +460,6 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 			}
 		}
 
-		cfg.Print()
-
 		if !cfg.ForceNewCluster {
 			id, cl, n, s, w = restartNode(cfg, snapshot)
 		} else {
@@ -515,6 +515,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		forceVersionC:    make(chan struct{}),
 		AccessController: &AccessController{CORS: cfg.CORS, HostWhitelist: cfg.HostWhitelist},
 	}
+	serverID.With(prometheus.Labels{"server_id": id.String()}).Set(1)
 
 	srv.applyV2 = &applierV2store{store: srv.v2store, cluster: srv.cluster}
 
@@ -523,7 +524,7 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 
 	// always recover lessor before kv. When we recover the mvcc.KV it will reattach keys to its leases.
 	// If we recover mvcc.KV first, it will attach the keys to the wrong lessor before it recovers.
-	srv.lessor = lease.NewLessor(srv.be, int64(math.Ceil(minTTL.Seconds())))
+	srv.lessor = lease.NewLessor(srv.getLogger(), srv.be, lease.LessorConfig{MinLeaseTTL: int64(math.Ceil(minTTL.Seconds())), CheckpointInterval: cfg.LeaseCheckpointInterval})
 	srv.kv = mvcc.New(srv.getLogger(), srv.be, srv.lessor, &srv.consistIndex)
 	if beExist {
 		kvindex := srv.kv.ConsistentIndex()
@@ -580,6 +581,10 @@ func NewServer(cfg ServerConfig) (srv *EtcdServer, err error) {
 		return nil, err
 	}
 
+	srv.lessor.SetCheckpointer(func(ctx context.Context, cp *pb.LeaseCheckpointRequest) {
+		srv.raftRequestOnce(ctx, pb.InternalRaftRequest{LeaseCheckpoint: cp})
+	})
+
 	// TODO: move transport initialization near the definition of remote
 	tr := &rafthttp.Transport{
 		Logger:      cfg.Logger,
@@ -620,6 +625,10 @@ func (s *EtcdServer) getLogger() *zap.Logger {
 	return l
 }
 
+func tickToDur(ticks int, tickMs uint) string {
+	return fmt.Sprintf("%v", time.Duration(ticks)*time.Duration(tickMs)*time.Millisecond)
+}
+
 func (s *EtcdServer) adjustTicks() {
 	lg := s.getLogger()
 	clusterN := len(s.cluster.Members())
@@ -632,7 +641,9 @@ func (s *EtcdServer) adjustTicks() {
 				"started as single-node; fast-forwarding election ticks",
 				zap.String("local-member-id", s.ID().String()),
 				zap.Int("forward-ticks", ticks),
+				zap.String("forward-duration", tickToDur(ticks, s.Cfg.TickMs)),
 				zap.Int("election-ticks", s.Cfg.ElectionTicks),
+				zap.String("election-timeout", tickToDur(s.Cfg.ElectionTicks, s.Cfg.TickMs)),
 			)
 		} else {
 			plog.Infof("%s as single-node; fast-forwarding %d ticks (election ticks %d)", s.ID(), ticks, s.Cfg.ElectionTicks)
@@ -677,7 +688,9 @@ func (s *EtcdServer) adjustTicks() {
 					"initialized peer connections; fast-forwarding election ticks",
 					zap.String("local-member-id", s.ID().String()),
 					zap.Int("forward-ticks", ticks),
+					zap.String("forward-duration", tickToDur(ticks, s.Cfg.TickMs)),
 					zap.Int("election-ticks", s.Cfg.ElectionTicks),
+					zap.String("election-timeout", tickToDur(s.Cfg.ElectionTicks, s.Cfg.TickMs)),
 					zap.Int("active-remote-members", peerN),
 				)
 			} else {
@@ -699,7 +712,7 @@ func (s *EtcdServer) Start() {
 	s.goAttach(func() { s.adjustTicks() })
 	s.goAttach(func() { s.publish(s.Cfg.ReqTimeout()) })
 	s.goAttach(s.purgeFile)
-	s.goAttach(func() { monitorFileDescriptor(s.stopping) })
+	s.goAttach(func() { monitorFileDescriptor(s.getLogger(), s.stopping) })
 	s.goAttach(s.monitorVersions)
 	s.goAttach(s.linearizableReadLoop)
 	s.goAttach(s.monitorKVHash)
@@ -742,6 +755,7 @@ func (s *EtcdServer) start() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.readwaitc = make(chan struct{}, 1)
 	s.readNotifier = newNotifier()
+	s.leaderChanged = make(chan struct{})
 	if s.ClusterVersion() != nil {
 		if lg != nil {
 			lg.Info(
@@ -928,7 +942,13 @@ func (s *EtcdServer) run() {
 					s.compactor.Resume()
 				}
 			}
-
+			if newLeader {
+				s.leaderChangedMu.Lock()
+				lc := s.leaderChanged
+				s.leaderChanged = make(chan struct{})
+				close(lc)
+				s.leaderChangedMu.Unlock()
+			}
 			// TODO: remove the nil checking
 			// current test utility does not provide the stats
 			if s.stats != nil {
@@ -1678,6 +1698,12 @@ func (s *EtcdServer) getLead() uint64 {
 	return atomic.LoadUint64(&s.lead)
 }
 
+func (s *EtcdServer) leaderChangedNotify() <-chan struct{} {
+	s.leaderChangedMu.RLock()
+	defer s.leaderChangedMu.RUnlock()
+	return s.leaderChanged
+}
+
 // RaftStatusGetter represents etcd server and Raft progress.
 type RaftStatusGetter interface {
 	ID() types.ID
@@ -2402,4 +2428,8 @@ func (s *EtcdServer) goAttach(f func()) {
 
 func (s *EtcdServer) Alarms() []*pb.AlarmMember {
 	return s.alarmStore.Get(pb.AlarmType_NONE)
+}
+
+func (s *EtcdServer) Logger() *zap.Logger {
+	return s.lg
 }

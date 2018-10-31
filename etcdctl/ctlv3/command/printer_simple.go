@@ -19,10 +19,10 @@ import (
 	"os"
 	"strings"
 
-	v3 "github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/clientv3/snapshot"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/pkg/types"
+	v3 "go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/clientv3/snapshot"
+	pb "go.etcd.io/etcd/etcdserver/etcdserverpb"
+	"go.etcd.io/etcd/pkg/types"
 )
 
 type simplePrinter struct {
@@ -86,11 +86,11 @@ func (s *simplePrinter) Grant(resp v3.LeaseGrantResponse) {
 	fmt.Printf("lease %016x granted with TTL(%ds)\n", resp.ID, resp.TTL)
 }
 
-func (p *simplePrinter) Revoke(id v3.LeaseID, r v3.LeaseRevokeResponse) {
+func (s *simplePrinter) Revoke(id v3.LeaseID, r v3.LeaseRevokeResponse) {
 	fmt.Printf("lease %016x revoked\n", id)
 }
 
-func (p *simplePrinter) KeepAlive(resp v3.LeaseKeepAliveResponse) {
+func (s *simplePrinter) KeepAlive(resp v3.LeaseKeepAliveResponse) {
 	fmt.Printf("lease %016x keepalived with TTL(%d)\n", resp.ID, resp.TTL)
 }
 

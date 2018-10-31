@@ -22,10 +22,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/pkg/testutil"
-	"github.com/coreos/etcd/pkg/transport"
-	"github.com/coreos/etcd/pkg/types"
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/pkg/testutil"
+	"go.etcd.io/etcd/pkg/transport"
+	"go.etcd.io/etcd/pkg/types"
 )
 
 func TestCtlV3MoveLeaderSecure(t *testing.T) {
@@ -72,10 +72,12 @@ func testCtlV3MoveLeader(t *testing.T, cfg etcdProcessClusterConfig) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp, err := cli.Status(context.Background(), ep)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := cli.Status(ctx, ep)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("failed to get status from endpoint %s: %v", ep, err)
 		}
+		cancel()
 		cli.Close()
 
 		if resp.Header.GetMemberId() == resp.Leader {

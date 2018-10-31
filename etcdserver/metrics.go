@@ -15,12 +15,14 @@
 package etcdserver
 
 import (
+	goruntime "runtime"
 	"time"
 
-	"github.com/coreos/etcd/pkg/runtime"
-	"github.com/coreos/etcd/version"
+	"go.etcd.io/etcd/pkg/runtime"
+	"go.etcd.io/etcd/version"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 )
 
 var (
@@ -78,6 +80,18 @@ var (
 		Name:      "proposals_failed_total",
 		Help:      "The total number of failed proposals seen.",
 	})
+	slowReadIndex = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "server",
+		Name:      "slow_read_indexes_total",
+		Help:      "The total number of pending read indexes not in sync with leader's or timed out read index requests.",
+	})
+	readIndexFailed = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "server",
+		Name:      "read_indexes_failed_total",
+		Help:      "The total number of failed read indexes seen.",
+	})
 	leaseExpired = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "etcd_debugging",
 		Subsystem: "server",
@@ -97,6 +111,20 @@ var (
 		Help:      "Which version is running. 1 for 'server_version' label with current version.",
 	},
 		[]string{"server_version"})
+	currentGoVersion = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "etcd",
+		Subsystem: "server",
+		Name:      "go_version",
+		Help:      "Which Go version server is running with. 1 for 'server_go_version' label with current version.",
+	},
+		[]string{"server_go_version"})
+	serverID = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "etcd",
+		Subsystem: "server",
+		Name:      "id",
+		Help:      "Server or member ID in hexadecimal format. 1 for 'server_id' label with current ID.",
+	},
+		[]string{"server_id"})
 )
 
 func init() {
@@ -109,31 +137,50 @@ func init() {
 	prometheus.MustRegister(proposalsApplied)
 	prometheus.MustRegister(proposalsPending)
 	prometheus.MustRegister(proposalsFailed)
+	prometheus.MustRegister(slowReadIndex)
+	prometheus.MustRegister(readIndexFailed)
 	prometheus.MustRegister(leaseExpired)
 	prometheus.MustRegister(quotaBackendBytes)
 	prometheus.MustRegister(currentVersion)
+	prometheus.MustRegister(currentGoVersion)
+	prometheus.MustRegister(serverID)
 
 	currentVersion.With(prometheus.Labels{
 		"server_version": version.Version,
 	}).Set(1)
+	currentGoVersion.With(prometheus.Labels{
+		"server_go_version": goruntime.Version(),
+	}).Set(1)
 }
 
-func monitorFileDescriptor(done <-chan struct{}) {
+func monitorFileDescriptor(lg *zap.Logger, done <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		used, err := runtime.FDUsage()
 		if err != nil {
-			plog.Errorf("cannot monitor file descriptor usage (%v)", err)
+			if lg != nil {
+				lg.Warn("failed to get file descriptor usage", zap.Error(err))
+			} else {
+				plog.Errorf("cannot monitor file descriptor usage (%v)", err)
+			}
 			return
 		}
 		limit, err := runtime.FDLimit()
 		if err != nil {
-			plog.Errorf("cannot monitor file descriptor usage (%v)", err)
+			if lg != nil {
+				lg.Warn("failed to get file descriptor limit", zap.Error(err))
+			} else {
+				plog.Errorf("cannot monitor file descriptor usage (%v)", err)
+			}
 			return
 		}
 		if used >= limit/5*4 {
-			plog.Warningf("80%% of the file descriptor limit is used [used = %d, limit = %d]", used, limit)
+			if lg != nil {
+				lg.Warn("80%% of file descriptors are used", zap.Uint64("used", used), zap.Uint64("limit", limit))
+			} else {
+				plog.Warningf("80%% of the file descriptor limit is used [used = %d, limit = %d]", used, limit)
+			}
 		}
 		select {
 		case <-ticker.C:

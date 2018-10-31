@@ -20,9 +20,10 @@ import (
 	"math"
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 
-	pb "github.com/coreos/etcd/raft/raftpb"
+	pb "go.etcd.io/etcd/raft/raftpb"
 )
 
 // nextEnts returns the appliable entries and updates the applied index
@@ -34,6 +35,12 @@ func nextEnts(r *raft, s *MemoryStorage) (ents []pb.Entry) {
 	ents = r.raftLog.nextEnts()
 	r.raftLog.appliedTo(r.raftLog.committed)
 	return ents
+}
+
+func mustAppendEntry(r *raft, ents ...pb.Entry) {
+	if !r.appendEntry(ents...) {
+		panic("entry unexpectedly dropped")
+	}
 }
 
 type stateMachine interface {
@@ -293,6 +300,154 @@ func TestProgressPaused(t *testing.T) {
 	}
 }
 
+func TestProgressFlowControl(t *testing.T) {
+	cfg := newTestConfig(1, []uint64{1, 2}, 5, 1, NewMemoryStorage())
+	cfg.MaxInflightMsgs = 3
+	cfg.MaxSizePerMsg = 2048
+	r := newRaft(cfg)
+	r.becomeCandidate()
+	r.becomeLeader()
+
+	// Throw away all the messages relating to the initial election.
+	r.readMessages()
+
+	// While node 2 is in probe state, propose a bunch of entries.
+	r.prs[2].becomeProbe()
+	blob := []byte(strings.Repeat("a", 1000))
+	for i := 0; i < 10; i++ {
+		r.Step(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: blob}}})
+	}
+
+	ms := r.readMessages()
+	// First append has two entries: the empty entry to confirm the
+	// election, and the first proposal (only one proposal gets sent
+	// because we're in probe state).
+	if len(ms) != 1 || ms[0].Type != pb.MsgApp {
+		t.Fatalf("expected 1 MsgApp, got %v", ms)
+	}
+	if len(ms[0].Entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(ms[0].Entries))
+	}
+	if len(ms[0].Entries[0].Data) != 0 || len(ms[0].Entries[1].Data) != 1000 {
+		t.Fatalf("unexpected entry sizes: %v", ms[0].Entries)
+	}
+
+	// When this append is acked, we change to replicate state and can
+	// send multiple messages at once.
+	r.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAppResp, Index: ms[0].Entries[1].Index})
+	ms = r.readMessages()
+	if len(ms) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(ms))
+	}
+	for i, m := range ms {
+		if m.Type != pb.MsgApp {
+			t.Errorf("%d: expected MsgApp, got %s", i, m.Type)
+		}
+		if len(m.Entries) != 2 {
+			t.Errorf("%d: expected 2 entries, got %d", i, len(m.Entries))
+		}
+	}
+
+	// Ack all three of those messages together and get the last two
+	// messages (containing three entries).
+	r.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAppResp, Index: ms[2].Entries[1].Index})
+	ms = r.readMessages()
+	if len(ms) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(ms))
+	}
+	for i, m := range ms {
+		if m.Type != pb.MsgApp {
+			t.Errorf("%d: expected MsgApp, got %s", i, m.Type)
+		}
+	}
+	if len(ms[0].Entries) != 2 {
+		t.Errorf("%d: expected 2 entries, got %d", 0, len(ms[0].Entries))
+	}
+	if len(ms[1].Entries) != 1 {
+		t.Errorf("%d: expected 1 entry, got %d", 1, len(ms[1].Entries))
+	}
+}
+
+func TestUncommittedEntryLimit(t *testing.T) {
+	// Use a relatively large number of entries here to prevent regression of a
+	// bug which computed the size before it was fixed. This test would fail
+	// with the bug, either because we'd get dropped proposals earlier than we
+	// expect them, or because the final tally ends up nonzero. (At the time of
+	// writing, the former).
+	const maxEntries = 1024
+	testEntry := pb.Entry{Data: []byte("testdata")}
+	maxEntrySize := maxEntries * PayloadSize(testEntry)
+
+	cfg := newTestConfig(1, []uint64{1, 2, 3}, 5, 1, NewMemoryStorage())
+	cfg.MaxUncommittedEntriesSize = uint64(maxEntrySize)
+	cfg.MaxInflightMsgs = 2 * 1024 // avoid interference
+	r := newRaft(cfg)
+	r.becomeCandidate()
+	r.becomeLeader()
+	if n := r.uncommittedSize; n != 0 {
+		t.Fatalf("expected zero uncommitted size, got %d bytes", n)
+	}
+
+	// Set the two followers to the replicate state. Commit to tail of log.
+	const numFollowers = 2
+	r.prs[2].becomeReplicate()
+	r.prs[3].becomeReplicate()
+	r.uncommittedSize = 0
+
+	// Send proposals to r1. The first 5 entries should be appended to the log.
+	propMsg := pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{testEntry}}
+	propEnts := make([]pb.Entry, maxEntries)
+	for i := 0; i < maxEntries; i++ {
+		if err := r.Step(propMsg); err != nil {
+			t.Fatalf("proposal resulted in error: %v", err)
+		}
+		propEnts[i] = testEntry
+	}
+
+	// Send one more proposal to r1. It should be rejected.
+	if err := r.Step(propMsg); err != ErrProposalDropped {
+		t.Fatalf("proposal not dropped: %v", err)
+	}
+
+	// Read messages and reduce the uncommitted size as if we had committed
+	// these entries.
+	ms := r.readMessages()
+	if e := maxEntries * numFollowers; len(ms) != e {
+		t.Fatalf("expected %d messages, got %d", e, len(ms))
+	}
+	r.reduceUncommittedSize(propEnts)
+	if r.uncommittedSize != 0 {
+		t.Fatalf("committed everything, but still tracking %d", r.uncommittedSize)
+	}
+
+	// Send a single large proposal to r1. Should be accepted even though it
+	// pushes us above the limit because we were beneath it before the proposal.
+	propEnts = make([]pb.Entry, 2*maxEntries)
+	for i := range propEnts {
+		propEnts[i] = testEntry
+	}
+	propMsgLarge := pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: propEnts}
+	if err := r.Step(propMsgLarge); err != nil {
+		t.Fatalf("proposal resulted in error: %v", err)
+	}
+
+	// Send one more proposal to r1. It should be rejected, again.
+	if err := r.Step(propMsg); err != ErrProposalDropped {
+		t.Fatalf("proposal not dropped: %v", err)
+	}
+
+	// Read messages and reduce the uncommitted size as if we had committed
+	// these entries.
+	ms = r.readMessages()
+	if e := 1 * numFollowers; len(ms) != e {
+		t.Fatalf("expected %d messages, got %d", e, len(ms))
+	}
+	r.reduceUncommittedSize(propEnts)
+	if n := r.uncommittedSize; n != 0 {
+		t.Fatalf("expected zero uncommitted size, got %d", n)
+	}
+}
+
 func TestLeaderElection(t *testing.T) {
 	testLeaderElection(t, false)
 }
@@ -303,7 +458,7 @@ func TestLeaderElectionPreVote(t *testing.T) {
 
 func testLeaderElection(t *testing.T, preVote bool) {
 	var cfg func(*Config)
-	candState := StateType(StateCandidate)
+	candState := StateCandidate
 	candTerm := uint64(1)
 	if preVote {
 		cfg = preVoteConfig
@@ -800,7 +955,7 @@ func TestCommitWithoutNewTermEntry(t *testing.T) {
 	// network recovery
 	tt.recover()
 
-	// elect 1 as the new leader with term 2
+	// elect 2 as the new leader with term 2
 	// after append a ChangeTerm entry from the current term, all entries
 	// should be committed
 	tt.send(pb.Message{From: 2, To: 2, Type: pb.MsgHup})
@@ -1061,8 +1216,7 @@ func TestProposal(t *testing.T) {
 	for j, tt := range tests {
 		send := func(m pb.Message) {
 			defer func() {
-				// only recover is we expect it to panic so
-				// panics we don't expect go up.
+				// only recover if we expect it to panic (success==false)
 				if !tt.success {
 					e := recover()
 					if e != nil {
@@ -1075,7 +1229,7 @@ func TestProposal(t *testing.T) {
 
 		data := []byte("somedata")
 
-		// promote 0 the leader
+		// promote 1 to become leader
 		send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
 		send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: data}}})
 
@@ -1370,7 +1524,7 @@ func TestHandleHeartbeatResp(t *testing.T) {
 
 // TestRaftFreesReadOnlyMem ensures raft will free read request from
 // readOnly readIndexQueue and pendingReadIndex map.
-// related issue: https://github.com/coreos/etcd/issues/7571
+// related issue: https://go.etcd.io/etcd/issues/7571
 func TestRaftFreesReadOnlyMem(t *testing.T) {
 	sm := newTestRaft(1, []uint64{1, 2}, 5, 1, NewMemoryStorage())
 	sm.becomeCandidate()
@@ -1675,7 +1829,7 @@ func TestAllServerStepdown(t *testing.T) {
 			if sm.Term != tt.wterm {
 				t.Errorf("#%d.%d term = %v , want %v", i, j, sm.Term, tt.wterm)
 			}
-			if uint64(sm.raftLog.lastIndex()) != tt.windex {
+			if sm.raftLog.lastIndex() != tt.windex {
 				t.Errorf("#%d.%d index = %v , want %v", i, j, sm.raftLog.lastIndex(), tt.windex)
 			}
 			if uint64(len(sm.raftLog.allEntries())) != tt.windex {
@@ -2304,10 +2458,10 @@ func TestReadOnlyOptionLease(t *testing.T) {
 // when it commits at least one log entry at it term.
 func TestReadOnlyForNewLeader(t *testing.T) {
 	nodeConfigs := []struct {
-		id            uint64
-		committed     uint64
-		applied       uint64
-		compact_index uint64
+		id           uint64
+		committed    uint64
+		applied      uint64
+		compactIndex uint64
 	}{
 		{1, 1, 1, 0},
 		{2, 2, 2, 2},
@@ -2318,8 +2472,8 @@ func TestReadOnlyForNewLeader(t *testing.T) {
 		storage := NewMemoryStorage()
 		storage.Append([]pb.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1}})
 		storage.SetHardState(pb.HardState{Term: 1, Commit: c.committed})
-		if c.compact_index != 0 {
-			storage.Compact(c.compact_index)
+		if c.compactIndex != 0 {
+			storage.Compact(c.compactIndex)
 		}
 		cfg := newTestConfig(c.id, []uint64{1, 2, 3}, 10, 1, storage)
 		cfg.Applied = c.applied
@@ -2432,7 +2586,7 @@ func TestLeaderAppResp(t *testing.T) {
 }
 
 // When the leader receives a heartbeat tick, it should
-// send a MsgApp with m.Index = 0, m.LogTerm=0 and empty entries.
+// send a MsgHeartbeat with m.Index = 0, m.LogTerm=0 and empty entries.
 func TestBcastBeat(t *testing.T) {
 	offset := uint64(1000)
 	// make a state machine with log.offset = 1000
@@ -2451,7 +2605,7 @@ func TestBcastBeat(t *testing.T) {
 	sm.becomeCandidate()
 	sm.becomeLeader()
 	for i := 0; i < 10; i++ {
-		sm.appendEntry(pb.Entry{Index: uint64(i) + 1})
+		mustAppendEntry(sm, pb.Entry{Index: uint64(i) + 1})
 	}
 	// slow follower
 	sm.prs[2].Match, sm.prs[2].Next = 5, 6
@@ -2575,7 +2729,7 @@ func TestSendAppendForProgressProbe(t *testing.T) {
 			// we expect that raft will only send out one msgAPP on the first
 			// loop. After that, the follower is paused until a heartbeat response is
 			// received.
-			r.appendEntry(pb.Entry{Data: []byte("somedata")})
+			mustAppendEntry(r, pb.Entry{Data: []byte("somedata")})
 			r.sendAppend(2)
 			msg := r.readMessages()
 			if len(msg) != 1 {
@@ -2590,7 +2744,7 @@ func TestSendAppendForProgressProbe(t *testing.T) {
 			t.Errorf("paused = %v, want true", r.prs[2].Paused)
 		}
 		for j := 0; j < 10; j++ {
-			r.appendEntry(pb.Entry{Data: []byte("somedata")})
+			mustAppendEntry(r, pb.Entry{Data: []byte("somedata")})
 			r.sendAppend(2)
 			if l := len(r.readMessages()); l != 0 {
 				t.Errorf("len(msg) = %d, want %d", l, 0)
@@ -2637,7 +2791,7 @@ func TestSendAppendForProgressReplicate(t *testing.T) {
 	r.prs[2].becomeReplicate()
 
 	for i := 0; i < 10; i++ {
-		r.appendEntry(pb.Entry{Data: []byte("somedata")})
+		mustAppendEntry(r, pb.Entry{Data: []byte("somedata")})
 		r.sendAppend(2)
 		msgs := r.readMessages()
 		if len(msgs) != 1 {
@@ -2654,7 +2808,7 @@ func TestSendAppendForProgressSnapshot(t *testing.T) {
 	r.prs[2].becomeSnapshot(10)
 
 	for i := 0; i < 10; i++ {
-		r.appendEntry(pb.Entry{Data: []byte("somedata")})
+		mustAppendEntry(r, pb.Entry{Data: []byte("somedata")})
 		r.sendAppend(2)
 		msgs := r.readMessages()
 		if len(msgs) != 0 {
@@ -3048,7 +3202,7 @@ func TestNewLeaderPendingConfig(t *testing.T) {
 	for i, tt := range tests {
 		r := newTestRaft(1, []uint64{1, 2}, 10, 1, NewMemoryStorage())
 		if tt.addEntry {
-			r.appendEntry(pb.Entry{Type: pb.EntryNormal})
+			mustAppendEntry(r, pb.Entry{Type: pb.EntryNormal})
 		}
 		r.becomeCandidate()
 		r.becomeLeader()
@@ -3986,6 +4140,10 @@ type network struct {
 	storage map[uint64]*MemoryStorage
 	dropm   map[connem]float64
 	ignorem map[pb.MessageType]bool
+
+	// msgHook is called for each message sent. It may inspect the
+	// message and return true to send it or false to drop it.
+	msgHook func(pb.Message) bool
 }
 
 // newNetwork initializes a network from peers.
@@ -4101,6 +4259,11 @@ func (nw *network) filter(msgs []pb.Message) []pb.Message {
 		default:
 			perc := nw.dropm[connem{m.From, m.To}]
 			if n := rand.Float64(); n < perc {
+				continue
+			}
+		}
+		if nw.msgHook != nil {
+			if !nw.msgHook(m) {
 				continue
 			}
 		}

@@ -17,14 +17,29 @@ package raft
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/pkg/testutil"
-	"github.com/coreos/etcd/raft/raftpb"
+	"go.etcd.io/etcd/pkg/testutil"
+	"go.etcd.io/etcd/raft/raftpb"
 )
+
+// readyWithTimeout selects from n.Ready() with a 1-second timeout. It
+// panics on timeout, which is better than the indefinite wait that
+// would occur if this channel were read without being wrapped in a
+// select.
+func readyWithTimeout(n Node) Ready {
+	select {
+	case rd := <-n.Ready():
+		return rd
+	case <-time.After(time.Second):
+		panic("timed out waiting for ready")
+	}
+}
 
 // TestNodeStep ensures that node.Step sends msgProp to propc chan
 // and other kinds of messages to recvc chan.
@@ -830,4 +845,209 @@ func TestNodeProposeAddLearnerNode(t *testing.T) {
 	<-applyConfChan
 	close(stop)
 	<-done
+}
+
+func TestAppendPagination(t *testing.T) {
+	const maxSizePerMsg = 2048
+	n := newNetworkWithConfig(func(c *Config) {
+		c.MaxSizePerMsg = maxSizePerMsg
+	}, nil, nil, nil)
+
+	seenFullMessage := false
+	// Inspect all messages to see that we never exceed the limit, but
+	// we do see messages of larger than half the limit.
+	n.msgHook = func(m raftpb.Message) bool {
+		if m.Type == raftpb.MsgApp {
+			size := 0
+			for _, e := range m.Entries {
+				size += len(e.Data)
+			}
+			if size > maxSizePerMsg {
+				t.Errorf("sent MsgApp that is too large: %d bytes", size)
+			}
+			if size > maxSizePerMsg/2 {
+				seenFullMessage = true
+			}
+		}
+		return true
+	}
+
+	n.send(raftpb.Message{From: 1, To: 1, Type: raftpb.MsgHup})
+
+	// Partition the network while we make our proposals. This forces
+	// the entries to be batched into larger messages.
+	n.isolate(1)
+	blob := []byte(strings.Repeat("a", 1000))
+	for i := 0; i < 5; i++ {
+		n.send(raftpb.Message{From: 1, To: 1, Type: raftpb.MsgProp, Entries: []raftpb.Entry{{Data: blob}}})
+	}
+	n.recover()
+
+	// After the partition recovers, tick the clock to wake everything
+	// back up and send the messages.
+	n.send(raftpb.Message{From: 1, To: 1, Type: raftpb.MsgBeat})
+	if !seenFullMessage {
+		t.Error("didn't see any messages more than half the max size; something is wrong with this test")
+	}
+}
+
+func TestCommitPagination(t *testing.T) {
+	s := NewMemoryStorage()
+	cfg := newTestConfig(1, []uint64{1}, 10, 1, s)
+	cfg.MaxSizePerMsg = 2048
+	r := newRaft(cfg)
+	n := newNode()
+	go n.run(r)
+	n.Campaign(context.TODO())
+
+	rd := readyWithTimeout(&n)
+	if len(rd.CommittedEntries) != 1 {
+		t.Fatalf("expected 1 (empty) entry, got %d", len(rd.CommittedEntries))
+	}
+	s.Append(rd.Entries)
+	n.Advance()
+
+	blob := []byte(strings.Repeat("a", 1000))
+	for i := 0; i < 3; i++ {
+		if err := n.Propose(context.TODO(), blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The 3 proposals will commit in two batches.
+	rd = readyWithTimeout(&n)
+	if len(rd.CommittedEntries) != 2 {
+		t.Fatalf("expected 2 entries in first batch, got %d", len(rd.CommittedEntries))
+	}
+	s.Append(rd.Entries)
+	n.Advance()
+	rd = readyWithTimeout(&n)
+	if len(rd.CommittedEntries) != 1 {
+		t.Fatalf("expected 1 entry in second batch, got %d", len(rd.CommittedEntries))
+	}
+	s.Append(rd.Entries)
+	n.Advance()
+}
+
+type ignoreSizeHintMemStorage struct {
+	*MemoryStorage
+}
+
+func (s *ignoreSizeHintMemStorage) Entries(lo, hi uint64, maxSize uint64) ([]raftpb.Entry, error) {
+	return s.MemoryStorage.Entries(lo, hi, math.MaxUint64)
+}
+
+// TestNodeCommitPaginationAfterRestart regression tests a scenario in which the
+// Storage's Entries size limitation is slightly more permissive than Raft's
+// internal one. The original bug was the following:
+//
+// - node learns that index 11 (or 100, doesn't matter) is committed
+// - nextEnts returns index 1..10 in CommittedEntries due to size limiting. However,
+//   index 10 already exceeds maxBytes, due to a user-provided impl of Entries.
+// - Commit index gets bumped to 10
+// - the node persists the HardState, but crashes before applying the entries
+// - upon restart, the storage returns the same entries, but `slice` takes a different code path
+//   (since it is now called with an upper bound of 10) and removes the last entry.
+// - Raft emits a HardState with a regressing commit index.
+//
+// A simpler version of this test would have the storage return a lot less entries than dictated
+// by maxSize (for example, exactly one entry) after the restart, resulting in a larger regression.
+// This wouldn't need to exploit anything about Raft-internal code paths to fail.
+func TestNodeCommitPaginationAfterRestart(t *testing.T) {
+	s := &ignoreSizeHintMemStorage{
+		MemoryStorage: NewMemoryStorage(),
+	}
+	persistedHardState := raftpb.HardState{
+		Term:   1,
+		Vote:   1,
+		Commit: 10,
+	}
+
+	s.hardState = persistedHardState
+	s.ents = make([]raftpb.Entry, 10)
+	var size uint64
+	for i := range s.ents {
+		ent := raftpb.Entry{
+			Term:  1,
+			Index: uint64(i + 1),
+			Type:  raftpb.EntryNormal,
+			Data:  []byte("a"),
+		}
+
+		s.ents[i] = ent
+		size += uint64(ent.Size())
+	}
+
+	cfg := newTestConfig(1, []uint64{1}, 10, 1, s)
+	// Set a MaxSizePerMsg that would suggest to Raft that the last committed entry should
+	// not be included in the initial rd.CommittedEntries. However, our storage will ignore
+	// this and *will* return it (which is how the Commit index ended up being 10 initially).
+	cfg.MaxSizePerMsg = size - uint64(s.ents[len(s.ents)-1].Size()) - 1
+
+	r := newRaft(cfg)
+	n := newNode()
+	go n.run(r)
+	defer n.Stop()
+
+	rd := readyWithTimeout(&n)
+	if !IsEmptyHardState(rd.HardState) && rd.HardState.Commit < persistedHardState.Commit {
+		t.Errorf("HardState regressed: Commit %d -> %d\nCommitting:\n%+v",
+			persistedHardState.Commit, rd.HardState.Commit,
+			DescribeEntries(rd.CommittedEntries, func(data []byte) string { return fmt.Sprintf("%q", data) }),
+		)
+	}
+}
+
+// TestNodeBoundedLogGrowthWithPartition tests a scenario where a leader is
+// partitioned from a quorum of nodes. It verifies that the leader's log is
+// protected from unbounded growth even as new entries continue to be proposed.
+// This protection is provided by the MaxUncommittedEntriesSize configuration.
+func TestNodeBoundedLogGrowthWithPartition(t *testing.T) {
+	const maxEntries = 16
+	data := []byte("testdata")
+	testEntry := raftpb.Entry{Data: data}
+	maxEntrySize := uint64(maxEntries * PayloadSize(testEntry))
+
+	s := NewMemoryStorage()
+	cfg := newTestConfig(1, []uint64{1}, 10, 1, s)
+	cfg.MaxUncommittedEntriesSize = maxEntrySize
+	r := newRaft(cfg)
+	n := newNode()
+	go n.run(r)
+	defer n.Stop()
+	n.Campaign(context.TODO())
+
+	rd := readyWithTimeout(&n)
+	if len(rd.CommittedEntries) != 1 {
+		t.Fatalf("expected 1 (empty) entry, got %d", len(rd.CommittedEntries))
+	}
+	s.Append(rd.Entries)
+	n.Advance()
+
+	// Simulate a network partition while we make our proposals by never
+	// committing anything. These proposals should not cause the leader's
+	// log to grow indefinitely.
+	for i := 0; i < 1024; i++ {
+		n.Propose(context.TODO(), data)
+	}
+
+	// Check the size of leader's uncommitted log tail. It should not exceed the
+	// MaxUncommittedEntriesSize limit.
+	checkUncommitted := func(exp uint64) {
+		t.Helper()
+		if a := r.uncommittedSize; exp != a {
+			t.Fatalf("expected %d uncommitted entry bytes, found %d", exp, a)
+		}
+	}
+	checkUncommitted(maxEntrySize)
+
+	// Recover from the partition. The uncommitted tail of the Raft log should
+	// disappear as entries are committed.
+	rd = readyWithTimeout(&n)
+	if len(rd.CommittedEntries) != maxEntries {
+		t.Fatalf("expected %d entries, got %d", maxEntries, len(rd.CommittedEntries))
+	}
+	s.Append(rd.Entries)
+	n.Advance()
+	checkUncommitted(0)
 }

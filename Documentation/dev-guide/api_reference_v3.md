@@ -476,6 +476,31 @@ Empty field.
 
 
 
+##### message `LeaseCheckpoint` (etcdserver/etcdserverpb/rpc.proto)
+
+| Field | Description | Type |
+| ----- | ----------- | ---- |
+| ID | ID is the lease ID to checkpoint. | int64 |
+| remaining_TTL | Remaining_TTL is the remaining time until expiry of the lease. | int64 |
+
+
+
+##### message `LeaseCheckpointRequest` (etcdserver/etcdserverpb/rpc.proto)
+
+| Field | Description | Type |
+| ----- | ----------- | ---- |
+| checkpoints |  | (slice of) LeaseCheckpoint |
+
+
+
+##### message `LeaseCheckpointResponse` (etcdserver/etcdserverpb/rpc.proto)
+
+| Field | Description | Type |
+| ----- | ----------- | ---- |
+| header |  | ResponseHeader |
+
+
+
 ##### message `LeaseGrantRequest` (etcdserver/etcdserverpb/rpc.proto)
 
 | Field | Description | Type |
@@ -740,7 +765,7 @@ Empty field.
 | ----- | ----------- | ---- |
 | cluster_id | cluster_id is the ID of the cluster which sent the response. | uint64 |
 | member_id | member_id is the ID of the member which sent the response. | uint64 |
-| revision | revision is the key-value store revision when the request was applied. | int64 |
+| revision | revision is the key-value store revision when the request was applied. For watch progress responses, the header.revision indicates progress. All future events recieved in this stream are guaranteed to have a higher revision number than the header.revision number. | int64 |
 | raft_term | raft_term is the raft term when the request was applied. | uint64 |
 
 
@@ -840,6 +865,14 @@ From google paxosdb paper: Our implementation hinges around a powerful primitive
 
 
 
+##### message `WatchProgressRequest` (etcdserver/etcdserverpb/rpc.proto)
+
+Requests the a watch stream progress status be sent in the watch response stream as soon as possible.
+
+Empty field.
+
+
+
 ##### message `WatchRequest` (etcdserver/etcdserverpb/rpc.proto)
 
 | Field | Description | Type |
@@ -847,6 +880,7 @@ From google paxosdb paper: Our implementation hinges around a powerful primitive
 | request_union | request_union is a request to either create a new watcher or cancel an existing watcher. | oneof |
 | create_request |  | WatchCreateRequest |
 | cancel_request |  | WatchCancelRequest |
+| progress_request |  | WatchProgressRequest |
 
 
 
@@ -894,6 +928,7 @@ From google paxosdb paper: Our implementation hinges around a powerful primitive
 | ----- | ----------- | ---- |
 | ID |  | int64 |
 | TTL |  | int64 |
+| RemainingTTL |  | int64 |
 
 
 

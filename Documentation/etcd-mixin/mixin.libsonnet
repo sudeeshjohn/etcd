@@ -11,7 +11,7 @@
           {
             alert: 'EtcdInsufficientMembers',
             expr: |||
-              count(up{%(etcd_selector)s} == 0) by (job) > (count(up{%(etcd_selector)s}) by (job) / 2 - 1)
+              sum(up{%(etcd_selector)s} == bool 1) by (job) < ((count(up{%(etcd_selector)s}) by (job) + 1) / 2)
             ||| % $._config,
             'for': '3m',
             labels: {
@@ -91,52 +91,6 @@
             },
             annotations: {
               message: 'Etcd cluster "{{ $labels.job }}": gRPC requests to {{ $labels.grpc_method }} are taking {{ $value }}s on etcd instance {{ $labels.instance }}.',
-            },
-          },
-          {
-            alert: 'EtcdHighNumberOfFailedHTTPRequests',
-            expr: |||
-              100 * sum(rate(etcd_http_failed_total{%(etcd_selector)s}[5m])) BY (job, instance, method)
-                /
-              sum(rate(etcd_http_received_total{%(etcd_selector)s}[5m])) BY (job, instance, method)
-                > 1
-            ||| % $._config,
-            'for': '10m',
-            labels: {
-              severity: 'warning',
-            },
-            annotations: {
-              message: 'Etcd cluster "{{ $labels.job }}": {{ $value }}%% of requests for {{ $labels.method }} failed on etcd instance {{ $labels.instance }}.',
-            },
-          },
-          {
-            alert: 'EtcdHighNumberOfFailedHTTPRequests',
-            expr: |||
-              100 * sum(rate(etcd_http_failed_total{%(etcd_selector)s}[5m])) BY (job, instance, method)
-                /
-              sum(rate(etcd_http_received_total{%(etcd_selector)s}[5m])) BY (job, instance, method)
-                > 5
-            ||| % $._config,
-            'for': '5m',
-            labels: {
-              severity: 'critical',
-            },
-            annotations: {
-              message: 'Etcd cluster "{{ $labels.job }}": {{ $value }}%% of requests for {{ $labels.method }} failed on etcd instance {{ $labels.instance }}.',
-            },
-          },
-          {
-            alert: 'EtcdHTTPRequestsSlow',
-            expr: |||
-              histogram_quantile(0.99, rate(etcd_http_successful_duration_seconds_bucket{%(etcd_selector)s}[5m]))
-              > 0.15
-            ||| % $._config,
-            'for': '10m',
-            labels: {
-              severity: 'warning',
-            },
-            annotations: {
-              message: 'Etcd cluster "{{ $labels.job }}": HTTP requests to {{ $labels.method }} are taking {{ $value }} on etcd instance {{ $labels.instance }}.',
             },
           },
           {

@@ -10,6 +10,7 @@ RPC
 RPCs
 
 WithRequireLeader
+InfoLevel
 args
 backoff
 blackhole
@@ -20,12 +21,16 @@ cluster_proxy
 defragment
 defragmenting
 deleter
+dev
+/dev/null
+dev/null
 errClientDisconnected
 etcd
 gRPC
 goroutine
 goroutines
 healthcheck
+hostname
 iff
 inflight
 keepalive
@@ -95,3 +100,7 @@ BidiStreams
 transientFailure
 BackoffFunc
 CallOptions
+PermitWithoutStream
+__lostleader
+ErrConnClosing
+unfreed

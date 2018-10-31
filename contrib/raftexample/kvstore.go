@@ -21,7 +21,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/coreos/etcd/etcdserver/api/snap"
+	"go.etcd.io/etcd/etcdserver/api/snap"
 )
 
 // a key-value store backed by raft
@@ -95,8 +95,8 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 }
 
 func (s *kvstore) getSnapshot() ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return json.Marshal(s.kvStore)
 }
 

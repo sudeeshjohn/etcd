@@ -28,12 +28,11 @@ package raft
 
 import (
 	"fmt"
-	"testing"
-
 	"reflect"
 	"sort"
+	"testing"
 
-	pb "github.com/coreos/etcd/raft/raftpb"
+	pb "go.etcd.io/etcd/raft/raftpb"
 )
 
 func TestFollowerUpdateTermFromMessage(t *testing.T) {
@@ -104,8 +103,8 @@ func TestStartAsFollower(t *testing.T) {
 }
 
 // TestLeaderBcastBeat tests that if the leader receives a heartbeat tick,
-// it will send a msgApp with m.Index = 0, m.LogTerm=0 and empty entries as
-// heartbeat to all followers.
+// it will send a MsgHeartbeat with m.Index = 0, m.LogTerm=0 and empty entries
+// as heartbeat to all followers.
 // Reference: section 5.2
 func TestLeaderBcastBeat(t *testing.T) {
 	// heartbeat interval
@@ -114,7 +113,7 @@ func TestLeaderBcastBeat(t *testing.T) {
 	r.becomeCandidate()
 	r.becomeLeader()
 	for i := 0; i < 10; i++ {
-		r.appendEntry(pb.Entry{Index: uint64(i) + 1})
+		mustAppendEntry(r, pb.Entry{Index: uint64(i) + 1})
 	}
 
 	for i := 0; i < hi; i++ {
@@ -333,7 +332,7 @@ func testNonleaderElectionTimeoutRandomized(t *testing.T, state StateType) {
 	}
 }
 
-func TestFollowersElectioinTimeoutNonconflict(t *testing.T) {
+func TestFollowersElectionTimeoutNonconflict(t *testing.T) {
 	SetLogger(discardLogger)
 	defer SetLogger(defaultLogger)
 	testNonleadersElectionTimeoutNonconflict(t, StateFollower)

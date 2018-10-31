@@ -25,9 +25,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	bolt "github.com/coreos/bbolt"
 	"github.com/coreos/pkg/capnslog"
 	humanize "github.com/dustin/go-humanize"
+	bolt "go.etcd.io/bbolt"
 	"go.uber.org/zap"
 )
 
@@ -42,7 +42,7 @@ var (
 	// This only works for linux.
 	initialMmapSize = uint64(10 * 1024 * 1024 * 1024)
 
-	plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "mvcc/backend")
+	plog = capnslog.NewPackageLogger("go.etcd.io/etcd", "mvcc/backend")
 
 	// minSnapshotWarningTimeout is the minimum threshold to trigger a long running snapshot warning.
 	minSnapshotWarningTimeout = 30 * time.Second
@@ -399,14 +399,7 @@ func (b *backend) defrag() error {
 			plog.Panicf("cannot open database at %s (%v)", dbp, err)
 		}
 	}
-	b.batchTx.tx, err = b.db.Begin(true)
-	if err != nil {
-		if b.lg != nil {
-			b.lg.Fatal("failed to begin tx", zap.Error(err))
-		} else {
-			plog.Fatalf("cannot begin tx (%s)", err)
-		}
-	}
+	b.batchTx.tx = b.unsafeBegin(true)
 
 	b.readTx.reset()
 	b.readTx.tx = b.unsafeBegin(false)
