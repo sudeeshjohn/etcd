@@ -162,9 +162,13 @@ type Config struct {
 	//
 	// If single-node, it advances ticks regardless.
 	//
-	// See https://go.etcd.io/etcd/issues/9333 for more detail.
+	// See https://github.com/etcd-io/etcd/issues/9333 for more detail.
 	InitialElectionTickAdvance bool `json:"initial-election-tick-advance"`
 
+	// BackendBatchInterval is the maximum time before commit the backend transaction.
+	BackendBatchInterval time.Duration `json:"backend-batch-interval"`
+	// BackendBatchLimit is the maximum operations before commit the backend transaction.
+	BackendBatchLimit int   `json:"backend-batch-limit"`
 	QuotaBackendBytes int64 `json:"quota-backend-bytes"`
 	MaxTxnOps         uint  `json:"max-txn-ops"`
 	MaxRequestBytes   uint  `json:"max-request-bytes"`
@@ -246,7 +250,7 @@ type Config struct {
 	// CVE-2018-5702 reference:
 	// - https://bugs.chromium.org/p/project-zero/issues/detail?id=1447#c2
 	// - https://github.com/transmission/transmission/pull/468
-	// - https://go.etcd.io/etcd/issues/9353
+	// - https://github.com/etcd-io/etcd/issues/9353
 	HostWhitelist map[string]struct{}
 
 	// UserHandlers is for registering users handlers and only used for
@@ -297,6 +301,9 @@ type Config struct {
 	// Debug is true, to enable debug level logging.
 	Debug bool `json:"debug"`
 
+	// ZapLoggerBuilder is used to build the zap logger.
+	ZapLoggerBuilder func(*Config) error
+
 	// logger logs server-side operations. The default is nil,
 	// and "setupLogging" must be called before starting server.
 	// Do not set logger directly.
@@ -310,6 +317,9 @@ type Config struct {
 	// Must be either: "loggerConfig != nil" or "loggerCore != nil && loggerWriteSyncer != nil".
 	loggerCore        zapcore.Core
 	loggerWriteSyncer zapcore.WriteSyncer
+
+	// EnableGRPCGateway is false to disable grpc gateway.
+	EnableGRPCGateway bool `json:"enable-grpc-gateway"`
 
 	// TO BE DEPRECATED
 
